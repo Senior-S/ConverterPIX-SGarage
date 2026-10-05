@@ -36,6 +36,114 @@
 #include <structs/pma_0x05.h>
 
 #include <chrono>
+#include <filesystem>
+#include <limits>
+
+// Kept outside main because bundle extraction has its own I/O lifecycle.
+bool extractDefinitionBundle(String path, const String &exportpath)
+{
+	backslashesToSlashes(path);
+	path = makeSlashAtBegin(path);
+	auto files = getUFS()->readDir(path, true, true);
+	if (!files)
+	{
+		error("bundle", path, "Unable to enumerate directory!");
+		return false;
+	}
+	const auto outputPath = std::filesystem::u8path(exportpath);
+	auto temporaryPath = outputPath;
+	temporaryPath += ".tmp." + std::to_string(
+		std::chrono::steady_clock::now().time_since_epoch().count());
+	std::error_code fsError;
+	if (outputPath.has_parent_path())
+	{
+		std::filesystem::create_directories(outputPath.parent_path(), fsError);
+		if (fsError)
+		{
+			error("bundle", exportpath, "Unable to create output directory!");
+			return false;
+		}
+	}
+	std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
+	if (!output)
+	{
+		error("bundle", exportpath, "Unable to open temporary bundle!");
+		return false;
+	}
+	const char magic[8] = { 'S', 'G', 'D', 'E', 'F', 'B', '1', 0 };
+	output.write(magic, sizeof(magic));
+	Array<u8> buffer;
+	bool success = bool(output);
+	for (const auto &entry : *files)
+	{
+		if (!success) break;
+		if (entry.IsDirectory()) continue;
+		String filePath = entry.GetPath();
+		backslashesToSlashes(filePath);
+		filePath = makeSlashAtBegin(filePath);
+		if (filePath.size() > UINT32_MAX)
+		{
+			error("bundle", filePath, "Path exceeds bundle format limit!");
+			success = false;
+			break;
+		}
+		// Use UFS lookup rather than the directory entry's source to keep overlay masking.
+		auto input = getUFS()->open(filePath, FileSystem::read | FileSystem::binary);
+		if (!input || !input->seek(0, File::SeekSet))
+		{
+			error("bundle", filePath, "Unable to open or seek input!");
+			success = false;
+			break;
+		}
+		const uint32_t pathLength = static_cast<uint32_t>(filePath.size());
+		const uint64_t contentsLength = input->size();
+		if (contentsLength > (std::numeric_limits<size_t>::max)() ||
+			contentsLength > uint64_t((std::numeric_limits<std::streamsize>::max)()))
+		{
+			error("bundle", filePath, "Contents exceed addressable buffer or output stream limits!");
+			success = false;
+			break;
+		}
+		// GDeflate entries require one full-entry read. Reuse capacity across files.
+		buffer.clear();
+		if (contentsLength && (!input->getContents(buffer) || buffer.size() != contentsLength))
+		{
+			error("bundle", filePath, "Short read while extracting bundle!");
+			success = false;
+			break;
+		}
+		char header[12];
+		for (unsigned i = 0; i < 4; ++i) header[i] = char(pathLength >> (i * 8));
+		for (unsigned i = 0; i < 8; ++i) header[4 + i] = char(contentsLength >> (i * 8));
+		output.write(header, sizeof(header));
+		output.write(filePath.data(), static_cast<std::streamsize>(filePath.size()));
+		if (!buffer.empty())
+		{
+			output.write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+		}
+		success = bool(output);
+	}
+	output.flush();
+	success = success && bool(output);
+	output.close();
+	success = success && !output.fail();
+	if (success)
+	{
+#ifdef _WIN32
+		success = MoveFileExW(temporaryPath.c_str(), outputPath.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+		std::filesystem::rename(temporaryPath, outputPath, fsError);
+		success = !fsError;
+#endif
+	}
+	if (!success)
+	{
+		std::filesystem::remove(temporaryPath, fsError);
+		error("bundle", exportpath, "Bundle extraction or atomic publication failed!");
+	}
+	return success;
+}
 
 void print_help()
 {
@@ -90,6 +198,19 @@ void print_help()
 		   "  --output-dds-dxt10\n"
 		   "              switch: output DDS files in DXT10 format\n"
 		   "\n"
+		   "  --garage-capabilities\n"
+		   "              prints garage format version and optional mode support as JSON\n"
+		   "  --extract-bundle <dir_path> -e <bundle_file>\n"
+		   "              extracts a virtual directory into an atomic definition bundle\n"
+		   "  --batch <manifest.tsv>\n"
+		   "              converts model/tobj TSV jobs after mounting bases once\n"
+		   "  --garage-preview\n"
+		   "              skips collision/prefab loading and auxiliary model exports\n"
+		   "  --viewer-geometry\n"
+		   "              writes garage geometry instead of PIM, retaining PIT/textures\n"
+		   "  --show-elapsed-time\n"
+		   "              prints mounting time and elapsed conversion time\n"
+		   "\n"
 		   " Usage:\n"
 		   "\n"
 		   "  converter_pix -b C:\\ets2_base -m /vehicle/truck/man_tgx/interior/anim s_wheel\n"
@@ -140,12 +261,20 @@ void print_help()
 	);
 }
 
-bool convertSingleModel(String filepath, String exportpath, Array<String> optionalArgs);
-bool convertWholeBase(FileSystem *fs, String exportpath);
+bool convertSingleModel(String filepath, String exportpath, Array<String> optionalArgs, bool garagePreview = false, bool viewerGeometry = false);
+bool convertWholeBase(FileSystem *fs, String exportpath, bool garagePreview = false, bool viewerGeometry = false);
 bool printMatchingAnimations( String modelFilePath );
 
 int main(int argc, char *argv[])
 {
+	for (int i = 1; i < argc; ++i)
+	{
+		if (String(argv[i]) == "--garage-capabilities")
+		{
+			printf("{\"garageFormatVersion\":1,\"definitionBundle\":true,\"viewerGeometry\":true,\"batch\":true,\"garagePreview\":true}\n");
+			return 0;
+		}
+	}
 	printf("\n"
 		   " ******************************************\n"
 		   " **        Converter PMX to PIX          **\n"
@@ -168,6 +297,10 @@ int main(int argc, char *argv[])
 	String path;
 	bool listdir_r = false;
 	bool showElapsedTime = false;
+	bool garagePreview = false;
+	bool viewerGeometry = false;
+	int explicitModes = 0;
+	bool garageModeRequested = false;
 
 	enum {
 		WHOLE_BASE,
@@ -177,6 +310,8 @@ int main(int argc, char *argv[])
 		SHOW_FILE,
 		EXTRACT_FILE,
 		EXTRACT_DIRECTORY,
+		EXTRACT_BUNDLE,
+		BATCH,
 		LIST_DIR,
 		CALC_CITYHASH64,
 		CALC_CITYHASH64_FILE,
@@ -203,11 +338,13 @@ int main(int argc, char *argv[])
 		else if( arg == "-m" || arg == "--model" )
 		{
 			mode = SINGLE_MODEL;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "-t" || arg == "--tobj" )
 		{
 			mode = SINGLE_TOBJ;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "-b" || arg == "--base" )
@@ -222,47 +359,78 @@ int main(int argc, char *argv[])
 		else if( arg == "-d" || arg == "--debug-dds" )
 		{
 			mode = DEBUG_DDS;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "--find-model-animations" )
 		{
 			mode = FIND_MODEL_ANIMATIONS;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "-extract_f" || arg == "--extract-file" )
 		{
 			mode = EXTRACT_FILE;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "-extract_d" || arg == "--extract-directory" )
 		{
 			mode = EXTRACT_DIRECTORY;
+			++explicitModes;
 			parameter = &path;
+		}
+		else if (arg == "--extract-bundle")
+		{
+			mode = EXTRACT_BUNDLE;
+			garageModeRequested = true;
+			++explicitModes;
+			parameter = &path;
+		}
+		else if (arg == "--batch")
+		{
+			mode = BATCH;
+			garageModeRequested = true;
+			++explicitModes;
+			parameter = &path;
+		}
+		else if (arg == "--garage-preview")
+		{
+			garagePreview = true;
+		}
+		else if (arg == "--viewer-geometry")
+		{
+			viewerGeometry = true;
 		}
 		else if( arg == "-listdir" || arg == "--list-directory" )
 		{
 			mode = LIST_DIR;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "-listdir_r" || arg == "--list-directory-recursive" )
 		{
 			mode = LIST_DIR;
+			++explicitModes;
 			listdir_r = true;
 			parameter = &path;
 		}
 		else if( arg == "-show_f" || arg == "--show-file" )
 		{
 			mode = SHOW_FILE;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "--calc-cityhash64" )
 		{
 			mode = CALC_CITYHASH64;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "--calc-cityhash64-file" )
 		{
 			mode = CALC_CITYHASH64_FILE;
+			++explicitModes;
 			parameter = &path;
 		}
 		else if( arg == "-matFormat147" || arg == "--output-material-format147" )
@@ -283,6 +451,67 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (parameter)
+	{
+		error("system", "", "Missing parameter value!");
+		return 1;
+	}
+	struct BatchJob { String kind; String path; String output; };
+	Array<BatchJob> batchJobs;
+	if (garageModeRequested)
+	{
+		if (explicitModes != 1 || !optionalArgs.empty() || basepath.empty() || path.empty() ||
+			(mode == EXTRACT_BUNDLE && exportpath.empty()))
+		{
+			error("system", "", "Specify one garage mode, its path, mounted bases, and a bundle export file when extracting!");
+			return 1;
+		}
+	}
+	if (mode == BATCH)
+	{
+		std::ifstream manifest(std::filesystem::u8path(path), std::ios::binary);
+		if (!manifest)
+		{
+			error("batch", path, "Unable to open manifest!");
+			return 1;
+		}
+		String line;
+		size_t lineNumber = 0;
+		while (std::getline(manifest, line))
+		{
+			++lineNumber;
+			if (lineNumber == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			const size_t first = line.find('\t');
+			const size_t second = first == String::npos ? String::npos : line.find('\t', first + 1);
+			if (first == String::npos || second == String::npos || line.find('\t', second + 1) != String::npos ||
+				line.find('\0') != String::npos || line.find('\r') != String::npos)
+			{
+				printf("Invalid batch manifest line %zu: expected exactly three TSV fields.\n", lineNumber);
+				return 1;
+			}
+			BatchJob job{line.substr(0, first), line.substr(first + 1, second - first - 1), line.substr(second + 1)};
+			backslashesToSlashes(job.path);
+			const auto extension = extractExtension(job.path);
+			if ((job.kind != "model" && job.kind != "tobj") || job.path.empty() || job.output.empty() ||
+				(job.kind == "model" && (extension == ".pmg" || extension == ".pmd")) ||
+				(job.kind == "tobj" && extension != ".tobj") || job.path.back() == '/' ||
+				("/" + job.path + "/").find("/../") != String::npos)
+			{
+				printf("Invalid batch manifest line %zu: invalid kind, virtual path, or output directory.\n", lineNumber);
+				return 1;
+			}
+			job.path = makeSlashAtBegin(job.path);
+			batchJobs.push_back(std::move(job));
+		}
+		if (manifest.bad() || batchJobs.empty())
+		{
+			error("batch", path, "Unable to read manifest or manifest contains no jobs!");
+			return 1;
+		}
+	}
+
+	const auto mountStart = std::chrono::steady_clock::now();
 	Map<String, FileSystem *> mountedBases;
 
 	int ufsPriority = 1;
@@ -290,7 +519,14 @@ int main(int argc, char *argv[])
 	for( const String &base : basepath )
 	{
 		mountedBases[ base ] = ufsMount( base, true, ufsPriority++ );
+		if (!mountedBases[base])
+		{
+			error("system", base, "Unable to mount base!");
+			return 1;
+		}
 	}
+
+	long long mountingUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - mountStart).count();
 
 	long long startTime =
 		std::chrono::duration_cast<std::chrono::microseconds>
@@ -311,7 +547,7 @@ int main(int argc, char *argv[])
 			{
 				exportpath = basepath.back() + "_exp";
 			}
-			convertSingleModel(path, exportpath, optionalArgs);
+			exitCode = convertSingleModel(path, exportpath, optionalArgs, garagePreview, viewerGeometry) ? 0 : 1;
 		} break;
 		case WHOLE_BASE:
 		{
@@ -326,7 +562,9 @@ int main(int argc, char *argv[])
 			if( baseToConvertIt == mountedBases.end() )
 			{
 				basepath.push_back( basePathToConvert );
+				const auto extraMountStart = std::chrono::steady_clock::now();
 				fsToConvert = mountedBases[ basePathToConvert ] = ufsMount( basePathToConvert, true, ufsPriority++ );
+				mountingUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - extraMountStart).count();
 			}
 			else
 			{
@@ -336,7 +574,7 @@ int main(int argc, char *argv[])
 			{
 				exportpath = basepath.back() + "_exp";
 			}
-			exitCode = convertWholeBase( fsToConvert, exportpath ) ? 0 : 1;
+			exitCode = fsToConvert && convertWholeBase( fsToConvert, exportpath, garagePreview, viewerGeometry ) ? 0 : 1;
 		} break;
 		case SINGLE_TOBJ:
 		{
@@ -353,9 +591,54 @@ int main(int argc, char *argv[])
 			TextureObject tobj;
 			if (tobj.load(path))
 			{
-				tobj.saveToMidFormats(exportpath);
+				exitCode = tobj.saveToMidFormats(exportpath) ? 0 : 1;
 				printf("%s: tobj: yes\n", path.substr(directory(path).length() + 1).c_str());
 			}
+			else exitCode = 1;
+		} break;
+		case EXTRACT_BUNDLE:
+		{
+			exitCode = extractDefinitionBundle(path, exportpath) ? 0 : 1;
+		} break;
+		case BATCH:
+		{
+			auto jsonString = [](const String &value) {
+				String quoted = "\"";
+				for (unsigned char character : value)
+				{
+					if (character == '"' || character == '\\') quoted += '\\';
+					if (character < 0x20) quoted += fmt::sprintf("\\u%04x", unsigned(character));
+					else quoted += char(character);
+				}
+				return quoted + '"';
+			};
+			for (size_t i = 0; i < batchJobs.size(); ++i)
+			{
+				const auto &job = batchJobs[i];
+				resLib->destroy();
+				bool success = false;
+				try
+				{
+					if (job.kind == "model")
+					{
+						success = convertSingleModel(job.path, job.output, {}, garagePreview, viewerGeometry);
+					}
+					else
+					{
+						TextureObject tobj;
+						success = tobj.load(job.path) && tobj.saveToMidFormats(job.output);
+					}
+				}
+				catch (const std::exception &exception)
+				{
+					printf("Batch job exception: %s\n", exception.what());
+				}
+				if (!success) exitCode = 1;
+				printf("{\"garageJob\":%zu,\"kind\":%s,\"path\":%s,\"success\":%s}\n", i,
+					jsonString(job.kind).c_str(), jsonString(job.path).c_str(), success ? "true" : "false");
+				fflush(stdout);
+			}
+			resLib->destroy();
 		} break;
 		case DEBUG_DDS:
 		{
@@ -483,22 +766,36 @@ int main(int argc, char *argv[])
 
 	if( showElapsedTime )
 	{
+		printf("Mounting time: %lluus | %llums | %f s\n", mountingUs, mountingUs / 1000, double(mountingUs) / 1000000.0);
 		printf( "Elapsed time: %lluus | %llums | %f s\n", endTime - startTime, ( endTime - startTime ) / 1000, static_cast<float>( endTime - startTime ) / 1000.f / 1000.f );
 	}
 
 	return exitCode;
 }
 
-bool convertSingleModel(String filepath, String exportpath, Array<String> optionalArgs)
+bool convertSingleModel(String filepath, String exportpath, Array<String> optionalArgs, bool garagePreview, bool viewerGeometry)
 {
 	backslashesToSlashes(filepath);
+	if (viewerGeometry)
+	{
+		const String manifestPath = exportpath + filepath + ".sgm";
+		if (getSFS()->exists(manifestPath) && !getSFS()->remove(manifestPath))
+		{
+			printf("Unable to invalidate previous geometry manifest: %s\n", manifestPath.c_str());
+			return false;
+		}
+	}
 	auto model = std::make_shared<Model>();
-	if (!model->load(filepath))
+	if (!model->load(filepath, garagePreview))
 	{
 		printf("Failed to load: %s\n", filepath.c_str());
 		return false;
 	}
-	model->saveToMidFormat(exportpath, true);
+	if (!model->saveToMidFormat(exportpath, true, garagePreview, viewerGeometry))
+	{
+		printf("Failed to export: %s\n", filepath.c_str());
+		return false;
+	}
 	for (size_t i = 0; i < optionalArgs.size(); ++i)
 	{
 		if (optionalArgs[i] == "*")
@@ -541,7 +838,7 @@ bool convertSingleModel(String filepath, String exportpath, Array<String> option
 	return true;
 }
 
-bool convertWholeBase( FileSystem *fs, String exportpath )
+bool convertWholeBase( FileSystem *fs, String exportpath, bool garagePreview, bool viewerGeometry )
 {
 	auto files = fs->readDir("/", true, true);
 	if (!files)
@@ -575,14 +872,14 @@ bool convertWholeBase( FileSystem *fs, String exportpath )
 		{
 			const String modelPath = filename.substr(0, filename.length() - 4);
 			Model model;
-			if (!model.load(modelPath))
+			if (!model.load(modelPath, garagePreview))
 			{
 				printf("Failed to load: %s\n", modelPath.c_str());
 			}
 			else
 			{
 				printf("[%u/%u = %u%%]: ", i, size, (unsigned)(100.f * i / size));
-				model.saveToMidFormat(exportpath, false);
+				model.saveToMidFormat(exportpath, false, garagePreview, viewerGeometry);
 			}
 			++i;
 		}

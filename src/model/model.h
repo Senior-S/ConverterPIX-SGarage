@@ -61,7 +61,7 @@ public:
 	Model();
 	~Model();
 
-	bool load(String filePath);
+	bool load(String filePath, bool garagePreview = false);
 	void destroy();
 
 	bool loadModel();
@@ -70,10 +70,11 @@ public:
 	bool loadCollision();
 
 	bool saveToPim(String exportPath) const;
+	bool saveToViewer(String exportPath) const;
 	bool saveToPit(String exportPath) const;
 	bool saveToPis(String exportPath) const;
-	void convertTextures(String exportPath) const;
-	void saveToMidFormat(String exportPath, bool convertTexture = true) const;
+	bool convertTextures(String exportPath) const;
+	bool saveToMidFormat(String exportPath, bool convertTexture = true, bool garagePreview = false, bool viewerGeometry = false) const;
 
 	bool loaded() const { return m_loaded; }
 	String fileName() const { return m_fileName; }

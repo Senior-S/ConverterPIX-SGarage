@@ -19,5 +19,7 @@ obj_d/
 
 src/.vs/
 bin/
+docs/
+scripts/
 
 *.vcxproj.user

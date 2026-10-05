@@ -282,15 +282,33 @@ bool File::getContents( Array<u8> &buffer )
 
 bool copyFile(File *const input, File *const output)
 {
-	input->rewind();
+	if (!input || !output || !input->seek(0, File::SeekSet))
+	{
+		error("file", "", "Unable to seek input for copying!");
+		return false;
+	}
 	uint64_t toCopy = input->size();
 	const uint64_t bufferSize = 10 * 1024 * 1024;
-	uint8_t *buffer = new uint8_t[bufferSize];
-	for (uint64_t readed = 0; toCopy > 0 && (readed = input->read((char *)buffer, 1, std::min(bufferSize, toCopy))) != 0; toCopy -= readed)
+	static thread_local UniquePtr<uint8_t[]> buffer;
+	if (toCopy && !buffer)
 	{
-		output->write(buffer, 1, readed);
+		buffer = std::make_unique<uint8_t[]>(bufferSize);
 	}
-	delete[] buffer;
+	while (toCopy > 0)
+	{
+		const uint64_t count = std::min(bufferSize, toCopy);
+		if (input->read(buffer.get(), 1, count) != count)
+		{
+			error("file", "", "Short read while copying file!");
+			return false;
+		}
+		if (output->write(buffer.get(), 1, count) != count)
+		{
+			error("file", "", "Short write while copying file!");
+			return false;
+		}
+		toCopy -= count;
+	}
 	return true;
 }
 

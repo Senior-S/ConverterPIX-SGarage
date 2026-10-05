@@ -256,6 +256,7 @@ UsageInferredSettings UsageInferredSettings::get( TextureObject::Usage usage )
 
 bool TextureObject::saveToMidFormats( String exportpath )
 {
+	StringStream text;
 	if (m_converted)
 		return true;
 
@@ -269,6 +270,7 @@ bool TextureObject::saveToMidFormats( String exportpath )
 	if (m_type < TextureObject::_1D_MAP || m_type > TextureObject::_CUBE_MAP)
 	{
 		printf("Unsupported tobj type: \"%s\"!\n", m_filepath.c_str());
+		return false;
 	}
 
 	Optional< MemFileSystem > optionalExtractedTobjFs;
@@ -355,78 +357,84 @@ bool TextureObject::saveToMidFormats( String exportpath )
 
 	const UsageInferredSettings usageInferredSettings = UsageInferredSettings::get( m_usage );
 
-	*file << fmt::sprintf("map %s" SEOL, mapType(m_type).c_str());
+	text << fmt::sprintf("map %s" SEOL, mapType(m_type).c_str());
 	for (uint32_t i = 0; i < m_texturesCount; ++i)
 	{
-		*file << TAB << m_textures[i].c_str() << SEOL;
+		text << TAB << m_textures[i].c_str() << SEOL;
 
 		auto inputf = conversionLocalUfs.open(m_textures[i], FileSystem::read | FileSystem::binary);
 		if (!inputf)
 		{
 			printf("Could not open file: \"%s\" to copy-read!\n", m_textures[i].c_str());
-			continue;
+			return false;
 		}
 		auto outputf = getSFS()->open(exportpath + m_textures[i], FileSystem::write | FileSystem::binary);
 		if (!outputf)
 		{
 			printf("Could not open file: \"%s\" to copy-read!\n", (exportpath + m_textures[i]).c_str());
-			continue;
+			return false;
 		}
-		copyFile(inputf.get(), outputf.get());
+		if (!copyFile(inputf.get(), outputf.get())) return false;
 	}
 
 	if( !usageInferredSettings.addr() )
 	{
-		*file << "addr" << SEOL;
-		*file << TAB << addrAttribute(m_addr_u) << SEOL;
-		*file << TAB << addrAttribute(m_addr_v) << SEOL;
+		text << "addr" << SEOL;
+		text << TAB << addrAttribute(m_addr_u) << SEOL;
+		text << TAB << addrAttribute(m_addr_v) << SEOL;
 		if (m_type == TextureObject::_CUBE_MAP)
 		{
-			*file << TAB << addrAttribute(m_addr_w) << SEOL;
+			text << TAB << addrAttribute(m_addr_w) << SEOL;
 		}
 	}
 
 	if (m_mipFilter == TextureObject::LINEAR)
 	{
-		*file << "trilinear" << SEOL;
+		text << "trilinear" << SEOL;
 	}
 	else
 	{
 		if (!usageInferredSettings.nomips() && m_mipFilter == TextureObject::NOMIPS)
 		{
-			*file << "nomips" << SEOL;
+			text << "nomips" << SEOL;
 		}
 		if (m_magFilter != TextureObject::DEFAULT || m_minFilter != TextureObject::DEFAULT)
 		{
-			*file << "filter" << TAB << filterAttribute(m_magFilter) << TAB << filterAttribute(m_minFilter) << SEOL;
+			text << "filter" << TAB << filterAttribute(m_magFilter) << TAB << filterAttribute(m_minFilter) << SEOL;
 		}
 	}
 
 	if (m_noanisotropic)
 	{
-		*file << "noanisotropic" << SEOL;
+		text << "noanisotropic" << SEOL;
 	}
 
 	if (!usageInferredSettings.nocompress() && m_nocompress)
 	{
-		*file << "nocompress" << SEOL;
+		text << "nocompress" << SEOL;
 	}
 
 	if (!usageInferredSettings.colorSpace() && m_linearColorSpace)
 	{
-		*file << "color_space linear" << SEOL;
+		text << "color_space linear" << SEOL;
 	}
 
 	if (m_usage != Usage::none)
 	{
-		*file << "usage " << usageString(m_usage) << SEOL;
+		text << "usage " << usageString(m_usage) << SEOL;
 	}
 
 	if (m_bias != 0)
 	{
-		*file << fmt::sprintf("bias %i" SEOL, m_bias);
+		text << fmt::sprintf("bias %i" SEOL, m_bias);
 	}
 
+	const String contents = text.str();
+	if (!file->blockWrite(contents.data(), contents.size()))
+	{
+		printf("Could not write tobj: %s\n", m_filepath.c_str());
+		return false;
+	}
 	m_converted = true;
 	return true;
 }

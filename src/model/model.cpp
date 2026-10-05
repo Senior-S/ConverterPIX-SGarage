@@ -39,6 +39,9 @@
 #include <structs/pmg_0x15.h>
 
 #include <glm/gtx/transform.hpp>
+#include <iomanip>
+#include <limits>
+#include <locale>
 
 using namespace prism;
 
@@ -50,10 +53,9 @@ Model::~Model()
 {
 }
 
-bool Model::load(String filePath)
+bool Model::load(String filePath, bool garagePreview)
 {
-	if (m_loaded)
-		destroy();
+	destroy();
 
 	m_filePath = filePath;
 	m_directory = directory(filePath);
@@ -62,8 +64,11 @@ bool Model::load(String filePath)
 	if (!loadDescriptor()) return false;
 	if (!loadModel()) return false;
 
-	loadPrefab();
-	loadCollision();
+	if (!garagePreview)
+	{
+		loadPrefab();
+		loadCollision();
+	}
 
 	m_loaded = true;
 	return true;
@@ -77,6 +82,8 @@ void Model::destroy()
 	m_pieces.clear();
 	m_looks.clear();
 	m_variants.clear();
+	m_prefab.reset();
+	m_collision.reset();
 
 	m_vertCount = 0;
 	m_triangleCount = 0;
@@ -1494,10 +1501,256 @@ bool Model::saveToPim(String exportPath) const
 	return true;
 }
 
+bool Model::saveToViewer(String exportPath) const
+{
+	// Keep the manifest absent until both files are complete. A failed rewrite
+	// must not leave a previous manifest pointing at a partial/new binary.
+	const String manifestPath = exportPath + m_filePath + ".sgm";
+	const String binaryPath = exportPath + m_filePath + ".sgb";
+	const String manifestTemp = manifestPath + ".tmp";
+	const String binaryTemp = binaryPath + ".tmp";
+	if (getSFS()->exists(manifestPath) && !getSFS()->remove(manifestPath))
+	{
+		error("model", m_filePath, "Unable to invalidate previous viewer manifest!");
+		return false;
+	}
+	if (!getSFS()->mkdir(directory(manifestPath)))
+		return false;
+	const uint16_t endian = 1;
+	if (*reinterpret_cast<const uint8_t *>(&endian) != 1 || sizeof(float) != 4)
+	{
+		error("model", m_filePath, "Viewer export requires little-endian 32-bit floats!");
+		return false;
+	}
+
+	std::ofstream binary(binaryTemp, std::ios::binary | std::ios::trunc);
+	if (!binary)
+	{
+		error("model", m_filePath, "Unable to open viewer binary for writing!");
+		return false;
+	}
+	StringStream json;
+	json.imbue(std::locale::classic());
+	// Python's PIM reader promotes float32 values to doubles. Preserve that
+	// exact value for locator/skeleton metadata as well as binary geometry.
+	json << std::setprecision(std::numeric_limits<double>::max_digits10);
+	bool valid = true;
+	uint64_t offset = 0;
+	// These local writers are shared by the stream and metadata sections. They
+	// avoid adding another serialization dependency to the converter.
+	auto quoted = [](const String &value) -> String {
+		String result = "\"";
+		const char *hex = "0123456789abcdef";
+		for (const unsigned char ch : value)
+		{
+			if (ch == '"' || ch == '\\') { result += '\\'; result += ch; }
+			else if (ch < 0x20)
+			{
+				result += "\\u00";
+				result += hex[ch >> 4]; result += hex[ch & 15];
+			}
+			else result += ch;
+		}
+		return result + '"';
+	};
+	auto numbers = [&](const float *values, size_t count) {
+		json << '[';
+		for (size_t i = 0; i < count; ++i)
+		{
+			if (i) json << ',';
+			if (!std::isfinite(values[i])) { valid = false; json << "null"; }
+			else json << values[i];
+		}
+		json << ']';
+	};
+	auto quaternion = [&](const Quaternion &value) {
+		const float values[] = {value.m_x, value.m_y, value.m_z, value.m_w};
+		numbers(values, 4);
+	};
+	auto descriptor = [&](const void *data, uint64_t count, uint32_t components, const char *type, uint32_t elementSize) {
+		const uint32_t padding = static_cast<uint32_t>((elementSize - offset % elementSize) % elementSize);
+		const char zeros[3] = {};
+		if (padding) binary.write(zeros, padding);
+		offset += padding;
+		json << "{\"offset\":" << offset << ",\"count\":" << count
+			 << ",\"components\":" << components << ",\"type\":" << quoted(type) << '}';
+		const uint64_t bytes = count * elementSize;
+		if (bytes) binary.write(static_cast<const char *>(data), static_cast<std::streamsize>(bytes));
+		offset += bytes;
+	};
+	json << "{\"format\":\"SGarageModel\",\"version\":1,\"binary\":" << quoted(m_fileName + ".sgb")
+		 << ",\"name\":" << quoted(m_fileName) << ",\"source\":" << quoted(STRING_VERSION) << ",\"materials\":[";
+	if (!m_looks.empty())
+	{
+		for (uint32_t i = 0; i < m_materialCount; ++i)
+		{
+			if (i) json << ',';
+			const auto &material = m_looks[0].m_materials[i];
+			json << "{\"alias\":" << quoted(material.alias()) << ",\"effect\":" << quoted(material.m_effect) << '}';
+		}
+	}
+	json << "],\"parts\":[";
+	for (size_t i = 0; i < m_parts.size(); ++i)
+	{
+		if (i) json << ',';
+		const auto &part = m_parts[i];
+		if (uint64_t(part.m_pieceId) + part.m_pieceCount > m_pieces.size()
+			|| uint64_t(part.m_locatorId) + part.m_locatorCount > m_locators.size()) valid = false;
+		json << "{\"name\":" << quoted(part.m_name) << ",\"pieces\":[";
+		for (uint32_t j = 0; j < part.m_pieceCount; ++j) { if (j) json << ','; json << part.m_pieceId + j; }
+		json << "],\"locators\":[";
+		for (uint32_t j = 0; j < part.m_locatorCount; ++j) { if (j) json << ','; json << part.m_locatorId + j; }
+		json << "]}";
+	}
+	json << "],\"pieces\":[";
+	for (size_t i = 0; i < m_pieces.size(); ++i)
+	{
+		if (i) json << ',';
+		const auto &piece = m_pieces[i];
+		if (piece.m_texcoordCount > Vertex::TEXCOORD_COUNT || piece.m_bones > Vertex::BONE_COUNT)
+		{
+			valid = false;
+			break;
+		}
+		json << "{\"index\":" << piece.m_index << ",\"material\":" << piece.m_material
+			 << ",\"vertexCount\":" << piece.m_vertices.size() << ",\"boneCount\":" << piece.m_bones << ",\"streams\":{";
+		bool first = true;
+		Array<float> values;
+		auto stream = [&](const String &tag, uint32_t components, const auto &value) {
+			values.clear();
+			values.reserve(piece.m_vertices.size() * components);
+			for (const auto &vertex : piece.m_vertices)
+			{
+				const auto &vector = value(vertex);
+				for (uint32_t j = 0; j < components; ++j)
+				{
+					if (!std::isfinite(vector[j])) valid = false;
+					values.push_back(vector[j]);
+				}
+			}
+			if (!first) json << ',';
+			first = false;
+			json << quoted(tag) << ':';
+			descriptor(values.data(), values.size(), components, "f32", 4);
+		};
+		if (piece.m_position) stream("_POSITION", 3, [](const Vertex &v) -> const Float3 & { return v.m_position; });
+		if (piece.m_normal) stream("_NORMAL", 3, [](const Vertex &v) -> const Float3 & { return v.m_normal; });
+		if (piece.m_tangent) stream("_TANGENT", 4, [](const Vertex &v) -> const Float4 & { return v.m_tangent; });
+		if (piece.m_texcoord)
+			for (uint32_t j = 0; j < piece.m_texcoordCount; ++j)
+				stream("_UV" + std::to_string(j), 2, [j](const Vertex &v) -> const Float2 & { return v.m_texcoords[j]; });
+		if (piece.m_color) stream("_RGBA", 4, [](const Vertex &v) -> const Float4 & { return v.m_color; });
+		if (piece.m_factor) stream("_FACTOR", 4, [](const Vertex &v) -> const Float4 & { return v.m_factor; });
+		if (piece.m_bones)
+		{
+			for (bool weights : {false, true})
+			{
+				Array<uint8_t> skin;
+				skin.reserve(piece.m_vertices.size() * piece.m_bones);
+				for (const auto &vertex : piece.m_vertices)
+					for (uint32_t j = 0; j < piece.m_bones; ++j)
+					{
+						if (vertex.m_boneWeight[j] && vertex.m_boneIndex[j] >= m_bones.size()) valid = false;
+						skin.push_back(weights ? vertex.m_boneWeight[j] : vertex.m_boneIndex[j]);
+					}
+				if (!first) json << ',';
+				first = false;
+				json << quoted(weights ? "_BONE_WEIGHT" : "_BONE_INDEX") << ':';
+				descriptor(skin.data(), skin.size(), piece.m_bones, "u8", 1);
+			}
+		}
+		json << "},\"uvAliases\":{";
+		if (piece.m_texcoord)
+			for (uint32_t j = 0; j < piece.m_texcoordCount; ++j)
+			{
+				if (j) json << ',';
+				json << quoted("_UV" + std::to_string(j)) << ":[";
+				const auto aliases = piece.texCoords(j);
+				for (size_t k = 0; k < aliases.size(); ++k)
+				{
+					if (k) json << ',';
+					json << quoted("_TEXCOORD" + std::to_string(aliases[k]));
+				}
+				json << ']';
+			}
+		Array<uint32_t> indices;
+		indices.reserve(piece.m_triangles.size() * 3);
+		for (const auto &triangle : piece.m_triangles)
+			for (size_t j = 0; j < 3; ++j)
+			{
+				const int index = triangle.m_attach[j];
+				if (index < 0 || static_cast<size_t>(index) >= piece.m_vertices.size()) valid = false;
+				indices.push_back(static_cast<uint32_t>(index));
+			}
+		json << "},\"indices\":";
+		descriptor(indices.data(), indices.size(), 1, "u32", 4);
+		json << '}';
+	}
+	json << "],\"locators\":[";
+	for (size_t i = 0; i < m_locators.size(); ++i)
+	{
+		if (i) json << ',';
+		const auto &locator = m_locators[i];
+		json << "{\"index\":" << locator.m_index << ",\"name\":" << quoted(locator.m_name) << ",\"position\":";
+		numbers(locator.m_position.m_a, 3);
+		json << ",\"rotation\":"; quaternion(locator.m_rotation);
+		json << ",\"scale\":"; numbers(locator.m_scale.m_a, 3);
+		json << ",\"hookup\":" << (locator.m_hookup.empty() ? "null" : quoted(locator.m_hookup)) << '}';
+	}
+	json << "],\"bones\":[";
+	for (size_t i = 0; i < m_bones.size(); ++i)
+	{
+		if (i) json << ',';
+		const auto &bone = m_bones[i];
+		if (bone.m_parent != 0xff && (bone.m_parent < 0 || static_cast<size_t>(bone.m_parent) >= m_bones.size() || bone.m_parent == bone.m_index)) valid = false;
+		json << "{\"index\":" << bone.m_index << ",\"name\":" << quoted(bone.m_name) << ",\"parent\":" << static_cast<int32_t>(bone.m_parent) << ",\"matrix\":";
+		numbers(&bone.m_transformation.m[0][0], 16);
+		json << ",\"inverseMatrix\":"; numbers(&bone.m_transReversed.m[0][0], 16);
+		json << ",\"translation\":"; numbers(bone.m_translation.m_a, 3);
+		json << ",\"rotation\":"; quaternion(bone.m_rotation);
+		json << ",\"scale\":"; numbers(bone.m_scale.m_a, 3);
+		json << ",\"stretch\":"; quaternion(bone.m_stretch);
+		if (!std::isfinite(bone.m_signOfDeterminantOfMatrix)) valid = false;
+		json << ",\"determinantSign\":" << bone.m_signOfDeterminantOfMatrix << '}';
+	}
+	json << "],\"binaryBytes\":" << offset << '}';
+	binary.flush();
+	valid = valid && binary.good();
+	binary.close();
+	valid = valid && !binary.fail();
+	if (valid)
+	{
+		std::ofstream manifest(manifestTemp, std::ios::binary | std::ios::trunc);
+		const String content = json.str();
+		manifest.write(content.data(), static_cast<std::streamsize>(content.size()));
+		manifest.flush();
+		valid = manifest.good();
+		manifest.close();
+		valid = valid && !manifest.fail();
+	}
+	// Renames publish the binary first and the small manifest last.
+	auto publish = [](const String &from, const String &to) -> bool {
+#ifdef _WIN32
+		return MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+		return std::rename(from.c_str(), to.c_str()) == 0;
+#endif
+	};
+	if (valid) valid = publish(binaryTemp, binaryPath) && publish(manifestTemp, manifestPath);
+	if (!valid)
+	{
+		getSFS()->remove(binaryTemp);
+		getSFS()->remove(manifestTemp);
+		error("model", m_filePath, "Viewer export failed; no complete viewer manifest was published!");
+	}
+	return valid;
+}
+
 bool Model::saveToPit(String exportPath) const
 {
 	const String pitFilePath = exportPath + m_filePath + ".pit";
-	auto file = getSFS()->open(pitFilePath, FileSystem::write | FileSystem::binary);
+	if (!getSFS()->mkdir(directory(pitFilePath))) return false;
+	std::ofstream file(pitFilePath, std::ios::binary | std::ios::trunc);
 	if (!file)
 	{
 		error_f("model", m_filePath, "Unable to save trait file [%s] (%s)!", pitFilePath, strerror(errno));
@@ -1544,10 +1797,13 @@ bool Model::saveToPit(String exportPath) const
 		}
 	}
 
-	Pix::StyledFileWriter writer;
-	writer.write(file.get(), root);
-	file->flush();
-	return true;
+	Pix::StyledStringWriter writer;
+	const String content = writer.write(root);
+	file.write(content.data(), static_cast<std::streamsize>(content.size()));
+	file.flush();
+	const bool written = file.good();
+	file.close();
+	return written && !file.fail();
 }
 
 bool Model::saveToPis(String exportPath) const
@@ -1608,30 +1864,44 @@ bool Model::saveToPis(String exportPath) const
 	return true;
 }
 
-void Model::convertTextures(String exportPath) const
+bool Model::convertTextures(String exportPath) const
 {
+	bool success = true;
 	for (size_t i = 0; i < m_looks.size(); ++i)
 	{
 		for (size_t j = 0; j < m_looks[i].m_materials.size(); ++j)
 		{
-			m_looks[i].m_materials[j].convertTextures(exportPath);
+			if (!m_looks[i].m_materials[j].convertTextures(exportPath)) success = false;
 		}
 	}
+	return success;
 }
 
-void Model::saveToMidFormat(String exportPath, bool convertTexture) const
+bool Model::saveToMidFormat(String exportPath, bool convertTexture, bool garagePreview, bool viewerGeometry) const
 {
-	bool pim = saveToPim(exportPath);
+	if (viewerGeometry)
+	{
+		const String manifestPath = exportPath + m_filePath + ".sgm";
+		if (getSFS()->exists(manifestPath) && !getSFS()->remove(manifestPath))
+		{
+			error("model", m_filePath, "Unable to invalidate previous viewer manifest!");
+			return false;
+		}
+	}
+	bool pim = !viewerGeometry && saveToPim(exportPath);
 	bool pit = saveToPit(exportPath);
-	bool pis = saveToPis(exportPath);
-	bool pic = m_collision ? m_collision->saveToPic(exportPath) : false;
-	bool pip = m_prefab ? m_prefab->saveToPip(exportPath) : false;
-	if (convertTexture) { convertTextures(exportPath); }
+	bool pis = !garagePreview && saveToPis(exportPath);
+	bool pic = !garagePreview && m_collision ? m_collision->saveToPic(exportPath) : false;
+	bool pip = !garagePreview && m_prefab ? m_prefab->saveToPip(exportPath) : false;
+	bool textures = !convertTexture || convertTextures(exportPath);
+	bool auxiliary = garagePreview || ((m_bones.empty() || pis) && (!m_collision || pic) && (!m_prefab || pip));
+	bool viewer = viewerGeometry && pit && textures && auxiliary && saveToViewer(exportPath);
 
 	auto state = [](bool x) -> const char * { return x ? "yes" : "no"; };
 
-	info_f("model", m_fileName, "pim:%s pit:%s pis:%s pic:%s pip:%s vertices:%i indices:%i materials:%i",
-		   state(pim), state(pit), state(pis), state(pic), state(pip), m_vertCount, m_triangleCount, m_materialCount);
+	info_f("model", m_fileName, "pim:%s pit:%s pis:%s pic:%s pip:%s viewer:%s vertices:%i indices:%i materials:%i",
+		   state(pim), state(pit), state(pis), state(pic), state(pip), state(viewer), m_vertCount, m_triangleCount, m_materialCount);
+	return (viewerGeometry ? viewer : pim) && pit && textures && auxiliary;
 }
 
 Bone *Model::bone(size_t index)

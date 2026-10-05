@@ -200,14 +200,15 @@ void Material::setAlias(String name)
 
 bool Material::convertTextures(String exportPath) const
 {
+	bool success = true;
 	for (auto &texture : m_textures)
 	{
 		if (texture.texobj())
 		{
-			texture.texobj()->saveToMidFormats(exportPath);
+			if (!texture.texobj()->saveToMidFormats(exportPath)) success = false;
 		}
 	}
-	return true;
+	return success;
 }
 
 void Material::setValues(Material::Attribute &attrib, const Array<String> &values, const int startIndex)
