@@ -166,8 +166,14 @@
       <AdditionalDependencies>deflate.lib;GDeflate.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <Manifest>
+      <AdditionalManifestFiles>$(ProjectDir)converter_pix.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
+    </Manifest>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="_main.cpp" />
+    <Manifest Include="converter_pix.manifest" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Core.vcxproj">
